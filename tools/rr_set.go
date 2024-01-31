@@ -3,8 +3,10 @@ package tools
 import (
 	"bytes"
 	"fmt"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/miekg/dns"
 )
@@ -19,6 +21,12 @@ type RRSetList []RRArray
 type NSEC3List struct {
 	hashed map[string]string
 	rrs    map[string]*dns.NSEC3
+}
+
+// Contains an RRArray and an int that will indicate the position in the set
+type RRData struct {
+	array RRArray
+	count int
 }
 
 // Len returns the length of an RRArray.
@@ -70,8 +78,30 @@ func (array RRArray) Less(i, j int) bool {
 // getTypeMap returns an map with the types contained in the array.
 func (array RRArray) getTypeMap() map[uint16]bool {
 	typeMap := make(map[uint16]bool)
-	for _, rr := range array {
-		typeMap[rr.Header().Rrtype] = true
+	n := len(array)
+	numSegments := runtime.NumCPU()
+	segmentSize := (n + numSegments - 1) / numSegments
+	resultChan := make(chan map[uint16]bool)
+	var wg sync.WaitGroup
+	for i := 0; i < len(array); i += segmentSize {
+		wg.Add(1)
+		go func(records RRArray) {
+			defer wg.Done()
+			segmentMap := make(map[uint16]bool)
+			for _, rr := range records {
+				segmentMap[rr.Header().Rrtype] = true
+			}
+			resultChan <- segmentMap
+		}(array[i:minimum(i+segmentSize, len(array))])
+	}
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+	for segmentMap := range resultChan {
+		for key := range segmentMap {
+			typeMap[key] = true
+		}
 	}
 	return typeMap
 }
@@ -88,8 +118,61 @@ func (nsec3Map NSEC3List) toSortedArray() RRArray {
 	for _, rr := range nsec3Map.rrs {
 		arr = append(arr, rr)
 	}
-	quickSort(arr)
+	mergeSort(arr)
 	return arr
+}
+func mergeSort(arr RRArray) RRArray {
+	if len(arr) <= 1 {
+		return arr
+	}
+	m := len(arr) / 2
+	l := mergeSort(arr[:m])
+	r := mergeSort(arr[m:])
+
+	result := make(RRArray, 0, len(l)+len(r))
+	i, j := 0, 0
+	for i < len(l) && j < len(r) {
+		if l.LessThan(r, i, j) {
+			result = append(result, l[i])
+			i++
+		} else {
+			result = append(result, r[j])
+			j++
+		}
+	}
+
+	result = append(result, l[i:]...)
+	result = append(result, r[j:]...)
+
+	return result
+}
+
+func (array RRArray) LessThan(array2 RRArray, i, j int) bool {
+
+	si := dns.SplitDomainName(array[i].Header().Name)
+	sj := dns.SplitDomainName(array2[j].Header().Name)
+
+	// Comparing tags, right to left
+	ii, ij := len(si)-1, len(sj)-1
+	for ii >= 0 && ij >= 0 {
+		if si[ii] != sj[ij] {
+			return si[ii] < sj[ij]
+		}
+		ii--
+		ij--
+	}
+	// Now one is a subdomain (or the same domain) of the other
+	if ii != ij {
+		return ii < ij
+	}
+	// Equal subdomain
+	if array[i].Header().Class != array2[j].Header().Class {
+		return array[i].Header().Class < array2[j].Header().Class
+	} else if array[i].Header().Rrtype != array2[j].Header().Rrtype {
+		return array[i].Header().Rrtype < array2[j].Header().Rrtype
+	} else {
+		return compareRRData(array[i], array2[j])
+	}
 }
 
 func (nsec3Map NSEC3List) add(ownerName string, param *dns.NSEC3PARAM, typeMap map[uint16]bool) error {
@@ -120,14 +203,31 @@ func (nsec3Map NSEC3List) add(ownerName string, param *dns.NSEC3PARAM, typeMap m
 		}
 		nsec3Map.rrs[hName] = nsec3
 	} else {
+
 		// It exists in the map. We need to update it
 		subTypeMap := make(map[uint16]bool)
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+
 		for k, v := range typeMap {
-			subTypeMap[k] = v
+			wg.Add(1)
+			go func(k uint16, v bool) {
+				defer wg.Done()
+				mu.Lock()
+				defer mu.Unlock()
+				subTypeMap[k] = v
+			}(k, v)
 		}
 		for _, t := range nsec3.TypeBitMap {
-			subTypeMap[t] = true
+			wg.Add(1)
+			go func(t uint16) {
+				defer wg.Done()
+				mu.Lock()
+				defer mu.Unlock()
+				subTypeMap[t] = true
+			}(t)
 		}
+		wg.Wait()
 		nsec3.TypeBitMap = newTypeArray(subTypeMap)
 	}
 	return nil
@@ -200,19 +300,21 @@ func (ctx *Context) getRRSetList(byType bool) (set RRSetList) {
 	// and by rsaLabel, class, type for RRSIG:
 	// An RRSIG record contains the signature for an RRset with a particular
 	// name, class, and type. RFC4034
-	setMap := make(map[string]RRArray)
+	setMap := make(map[string]RRData)
+	set = make(RRSetList, 0)
+	counter := 0
 	for _, rr := range ctx.rrs {
 		hash := getHash(rr, byType)
-		hashArr, ok := setMap[hash]
+		data, ok := setMap[hash]
 		if !ok {
-			hashArr = make(RRArray, 0)
-			setMap[hash] = hashArr
+			data = RRData{array: make(RRArray, 0), count: counter}
+			setMap[hash] = data
+			set = append(set, data.array)
+			counter++
 		}
-		setMap[hash] = append(hashArr, rr)
-	}
-	set = make(RRSetList, 0)
-	for _, rrSet := range setMap {
-		set = append(set, rrSet)
+		data.array = append(data.array, rr)
+		setMap[hash] = data
+		set[data.count] = data.array
 	}
 	return set
 }
@@ -222,37 +324,59 @@ func (ctx *Context) getRRSetList(byType bool) (set RRSetList) {
 func (ctx *Context) addNSECRecords() {
 
 	set := ctx.getRRSetList(false)
-
 	n := len(set)
-	for i, rrs := range set {
-		typeMap := make(map[uint16]struct{})
-		typeArray := make([]uint16, 0)
-		for _, rr := range rrs {
-			typeMap[rr.Header().Rrtype] = struct{}{}
+	numSegments := runtime.NumCPU()
+	segmentSize := (n + numSegments - 1) / numSegments
+
+	var wg sync.WaitGroup
+	results := make(chan *dns.NSEC, n)
+
+	for i := 0; i < n; i += segmentSize {
+		end := i + segmentSize
+		if end > n {
+			end = n
 		}
-		typeMap[dns.TypeNSEC] = struct{}{}
+		wg.Add(1)
+		go func(start, end int) {
+			defer wg.Done()
+			for j := start; j < end; j++ {
+				//
+				rrs := set[j]
+				typeMap := make(map[uint16]struct{})
+				typeArray := make([]uint16, 0)
+				for _, rr := range rrs {
+					typeMap[rr.Header().Rrtype] = struct{}{}
+				}
+				typeMap[dns.TypeNSEC] = struct{}{}
+				rrSetName := rrs[0].Header().Name
+				if rrSetName == ctx.Config.Zone {
+					typeMap[dns.TypeDNSKEY] = struct{}{}
+				}
+				for k := range typeMap {
+					typeArray = append(typeArray, k)
+				}
 
-		rrSetName := rrs[0].Header().Name
-		if rrSetName == ctx.Config.Zone {
-			typeMap[dns.TypeDNSKEY] = struct{}{}
-		}
-		
-		for k := range typeMap {
-			typeArray = append(typeArray, k)
-		}
+				sort.Slice(typeArray, func(i, j int) bool {
+					return typeArray[i] < typeArray[j]
+				})
 
-		sort.Slice(typeArray, func(i, j int) bool {
-			return typeArray[i] < typeArray[j]
-		})
+				nsec := &dns.NSEC{}
+				nsec.Hdr.Name = rrSetName
+				nsec.Hdr.Rrtype = dns.TypeNSEC
+				nsec.Hdr.Class = dns.ClassINET
+				nsec.Hdr.Ttl = rrs[0].Header().Ttl
+				nsec.NextDomain = set[(j+1)%n][0].Header().Name
+				nsec.TypeBitMap = typeArray
 
-		nsec := &dns.NSEC{}
-		nsec.Hdr.Name = rrSetName
-		nsec.Hdr.Rrtype = dns.TypeNSEC
-		nsec.Hdr.Class = dns.ClassINET
-		nsec.Hdr.Ttl = rrs[0].Header().Ttl
-		nsec.NextDomain = set[(i+1)%n][0].Header().Name
-		nsec.TypeBitMap = typeArray
-
+				results <- nsec
+			}
+		}(i, end)
+	}
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+	for nsec := range results {
 		ctx.rrs = append(ctx.rrs, nsec)
 	}
 }
@@ -287,37 +411,53 @@ func (ctx *Context) addNSEC3Records() (err error) {
 		param.Flags = 1
 	}
 	nsec3list := newNSEC3List()
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	errorChan := make(chan error)
 	for _, rrSet := range setList {
-		typeMap := rrSet.getTypeMap()
-		if typeMap[dns.TypeSOA] {
-			typeMap[dns.TypeNSEC3PARAM] = true
-		}
-
-		rrSetName := rrSet[0].Header().Name
-		if rrSetName == ctx.Config.Zone {
-			typeMap[dns.TypeDNSKEY] = true
-		}
-
-		if !(ctx.isSignable(rrSetName)) {
-			continue
-		}
-		// Add current NSEC3 RR
-		err := nsec3list.add(rrSet[0].Header().Name, param, typeMap)
-		if err != nil {
-			return err
-		}
-		// Add NSEC3 RRS for each sublabel
-		labels := dns.SplitDomainName(strings.TrimSuffix(rrSet[0].Header().Name, ctx.Config.Zone))
-		for i := range labels {
-			label := strings.Join(labels[i:], ".") + "." + ctx.Config.Zone
-			if len(label) == 0 {
-				break
+		wg.Add(1)
+		go func(rrSet RRArray) {
+			defer wg.Done()
+			typeMap := rrSet.getTypeMap()
+			if typeMap[dns.TypeSOA] {
+				typeMap[dns.TypeNSEC3PARAM] = true
 			}
-			err := nsec3list.add(label, param, typeMap) // we don't know if it is signable
+			rrSetName := rrSet[0].Header().Name
+			if rrSetName == ctx.Config.Zone {
+				typeMap[dns.TypeDNSKEY] = true
+			}
+			if !(ctx.isSignable(rrSetName)) {
+				return
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			// Add current NSEC3 RR
+			err := nsec3list.add(rrSet[0].Header().Name, param, typeMap)
 			if err != nil {
-				return err
+				errorChan <- err
+				return
 			}
-		}
+			// Add NSEC3 RRS for each sublabel
+			labels := dns.SplitDomainName(strings.TrimSuffix(rrSet[0].Header().Name, ctx.Config.Zone))
+			for i := range labels {
+				label := strings.Join(labels[i:], ".") + "." + ctx.Config.Zone
+				if len(label) == 0 {
+					break
+				}
+				err := nsec3list.add(label, param, typeMap) // we don't know if it is signable
+				if err != nil {
+					errorChan <- err
+					return
+				}
+			}
+		}(rrSet)
+	}
+	go func() {
+		wg.Wait()
+		close(errorChan)
+	}()
+	for err := range errorChan {
+		return err
 	}
 	// transform nsec3list to Sorted RRArray (to link to next hashes)
 	sortedList := nsec3list.toSortedArray()

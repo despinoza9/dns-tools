@@ -8,6 +8,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/miekg/dns"
@@ -17,15 +18,15 @@ import (
 // Context contains the state of a zone signing process.
 type Context struct {
 	Config         *ContextConfig
-	File           io.Reader           // zone path
-	Output         io.WriteCloser      // Out path
-	rrs            RRArray             // rrs
-	soa            *dns.SOA            // SOA RR
-	zonemd         [](*dns.ZONEMD)     // ZONEMD RRs
-	Log            *log.Logger         // Logger
-	SignAlgorithm  SignAlgorithm       // Sign Algorithm
-	DelegatedZones map[string]struct{} // Map with Delegated zones.
-	WithDS         map[string]struct{} // Map with zones with a DS RR
+	File           io.Reader             // zone path
+	Output         io.WriteCloser        // Out path
+	rrs            RRArray               // rrs
+	soa            *dns.SOA              // SOA RR
+	zonemdMap      map[uint8]*dns.ZONEMD // ZONEMD RRs with map
+	Log            *log.Logger           // Logger
+	SignAlgorithm  SignAlgorithm         // Sign Algorithm
+	DelegatedZones map[string]struct{}   // Map with Delegated zones.
+	WithDS         map[string]struct{}   // Map with zones with a DS RR
 	DNSKEYS        struct {
 		ZSK, KSK map[uint16]*dns.DNSKEY // DNSKEYS
 	}
@@ -83,17 +84,10 @@ func NewContext(config *ContextConfig, log *log.Logger) (ctx *Context, err error
 	return ctx, nil
 }
 
-// Check if a ZONEMD with same Schema and Hash Algorith exists on that context.
-
+// Check if a ZONEMD already exists .
 func (ctx *Context) isZONEMDAlready(newmd *dns.ZONEMD) bool {
-	if len(ctx.zonemd) > 0 {
-		for _, md := range ctx.zonemd {
-			if md.Scheme == newmd.Scheme && md.Hash == newmd.Hash {
-				return true
-			}
-		}
-	}
-	return false
+	_, exists := ctx.zonemdMap[newmd.Hash]
+	return exists
 }
 
 // ReadAndParseZone parses a DNS zone file and returns an array of rrs and the zone minTTL.
@@ -122,6 +116,9 @@ func (ctx *Context) ReadAndParseZone(updateSerial bool) error {
 	if ctx.DNSKEYS.ZSK == nil {
 		ctx.DNSKEYS.ZSK = make(map[uint16]*dns.DNSKEY)
 	}
+	if ctx.zonemdMap == nil {
+		ctx.zonemdMap = make(map[uint8]*dns.ZONEMD)
+	}
 
 	rrs := make(RRArray, 0)
 
@@ -129,7 +126,7 @@ func (ctx *Context) ReadAndParseZone(updateSerial bool) error {
 		ctx.Config.Zone += "."
 	}
 
-	zoneMDArray := make([]*dns.ZONEMD, 0)
+	zoneMDMap := make(map[uint8]*dns.ZONEMD)
 	zone := dns.NewZoneParser(ctx.File, ctx.Config.Zone, "")
 	if err := zone.Err(); err != nil {
 		return err
@@ -165,7 +162,7 @@ func (ctx *Context) ReadAndParseZone(updateSerial bool) error {
 				ctx.Config.Zone = strings.ToLower(rr.Header().Name)
 			}
 		case dns.TypeZONEMD:
-			zoneMDArray = append(zoneMDArray, rr.(*dns.ZONEMD))
+			zoneMDMap[rr.(*dns.ZONEMD).Hash] = rr.(*dns.ZONEMD)
 		case dns.TypeNS:
 			// I hate you RFC 4034, Section 6.2
 			rr.(*dns.NS).Ns = strings.ToLower(rr.(*dns.NS).Ns)
@@ -240,17 +237,36 @@ func (ctx *Context) ReadAndParseZone(updateSerial bool) error {
 	if ctx.Config.Zone == "" {
 		return fmt.Errorf("zone name not defined in arguments nor guessable using SOA RR. Try again using --zone argument")
 	}
+
+	var wg sync.WaitGroup
+
+	zonemdChan := make(chan *dns.ZONEMD)
+	errorChan := make(chan error)
 	// We look for the correct zonemd RRs
-	for _, newmd := range zoneMDArray {
-		if newmd.Header().Name == ctx.Config.Zone &&
-			(newmd.Scheme == 1) &&
-			(newmd.Hash == 1 || newmd.Hash == 2) { // hash 1-2?
-			if ctx.isZONEMDAlready(newmd) {
-				return fmt.Errorf("two ZONEMD with same Scheme and configured Hash found in zone")
-			} else {
-				ctx.zonemd = append(ctx.zonemd, newmd)
+	for _, newmd := range zoneMDMap {
+		wg.Add(1)
+		go func(newmd *dns.ZONEMD) {
+			defer wg.Done()
+			if newmd.Header().Name == ctx.Config.Zone && (newmd.Scheme == 1) && (newmd.Hash == 1 || newmd.Hash == 2) {
+				if ctx.isZONEMDAlready(newmd) {
+					errorChan <- fmt.Errorf("two ZONEMD with same Scheme and configured Hash found in zone")
+					return
+				} else {
+					zonemdChan <- newmd
+				}
 			}
-		}
+		}(newmd)
+	}
+	go func() {
+		wg.Wait()
+		close(zonemdChan)
+		close(errorChan)
+	}()
+	for md := range zonemdChan {
+		ctx.zonemdMap[md.Hash] = md
+	}
+	for e := range errorChan {
+		return e
 	}
 	ctx.rrs = rrs
 	ctx.DelegatedZones = delegatedZones
@@ -382,8 +398,14 @@ func (ctx *Context) CreateNewDNSKEY(flags uint16, publicKey string) *dns.DNSKEY 
 
 // PrintDS prints to log device DS value of zone:
 func (ctx *Context) PrintDS() {
+	var wg sync.WaitGroup
 	for _, key := range ctx.DNSKEYS.KSK {
-		ds := key.ToDS(dns.SHA256)
-		ctx.Log.Printf("DS [Tag %d]: \"%s\"", key.KeyTag(), ds)
+		wg.Add(1)
+		go func(k *dns.DNSKEY) {
+			defer wg.Done()
+			ds := k.ToDS(dns.SHA256)
+			ctx.Log.Printf("DS[Tag %d]:\"%s\"", k.KeyTag(), ds)
+		}(key)
 	}
+	wg.Wait()
 }

@@ -14,7 +14,9 @@ import (
 	"encoding/hex"
 	"fmt"
 	"hash"
+	"runtime"
 	"strings"
+	"sync"
 
 	"github.com/miekg/dns"
 )
@@ -25,8 +27,15 @@ var intToHash = map[uint8]func() hash.Hash{
 	2: sha512.New,
 }
 
+// ValidationResult contains results obtained in VerifyDigest
+type ValidationResult struct {
+	MDRecord *dns.ZONEMD
+	Error    error
+}
+
 // VerifyDigest validates a version of a zone with a valid ZONEMD RR.
 func (ctx *Context) VerifyDigest() error {
+
 	ctx.Log.Printf("Verifying ZONEMD digests")
 	if ctx.File == nil {
 		return fmt.Errorf("zone file not defined")
@@ -38,11 +47,11 @@ func (ctx *Context) VerifyDigest() error {
 	if err := ctx.ReadAndParseZone(false); err != nil {
 		return err
 	}
-	if ctx.zonemd == nil {
+	if ctx.zonemdMap == nil {
 		return fmt.Errorf("cannot verify (ZONEMD RR not present)")
 	}
-	for i := 0; i < len(ctx.zonemd); i++ {
-		if ctx.soa.Serial != ctx.zonemd[i].Serial {
+	for _, mdRR := range ctx.zonemdMap {
+		if ctx.soa.Serial != mdRR.Serial {
 			return fmt.Errorf("ZONEMD serial does not match with SOA serial")
 		}
 	}
@@ -50,12 +59,34 @@ func (ctx *Context) VerifyDigest() error {
 	quickSort(ctx.rrs)
 	ctx.Log.Printf("Zone sorted")
 
-	for _, mdRR := range ctx.zonemd {
-		ctx.Log.Printf("Checking ZONEMD %s with scheme %d and hashAlg %d", mdRR.Header().Name, mdRR.Scheme, mdRR.Hash)
-		if err := ctx.ValidateOrderedZoneDigest(mdRR.Hash, mdRR.Digest); err != nil {
-			return err
+	results := make(chan ValidationResult, len(ctx.zonemdMap))
+	var wg sync.WaitGroup
+	for _, mdRR := range ctx.zonemdMap {
+		wg.Add(1)
+		go func(mdRR *dns.ZONEMD) {
+			defer wg.Done()
+			ctx.Log.Printf("Checking ZONEMD %s with "+
+				"scheme %d and hashAlg %d", mdRR.Header().Name,
+				mdRR.Scheme, mdRR.Hash)
+			err := ctx.ValidateOrderedZoneDigest(mdRR.
+				Hash, mdRR.Digest)
+			results <- ValidationResult{MDRecord: mdRR,
+				Error: err}
+		}(mdRR)
+	}
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	for i := 0; i < len(ctx.zonemdMap); i++ {
+		result := <-results
+		if result.Error != nil {
+			return result.Error
 		}
-		ctx.Log.Printf("ZONEMD %s is valid!", mdRR.Header().Name)
+		ctx.Log.Printf("ZONEMD %s is valid!", result.
+			MDRecord.Header().Name)
 	}
 	return nil
 }
@@ -92,13 +123,7 @@ func (ctx *Context) Digest() error {
 // AddZONEMDRecord adds a zone digest following draft-ietf-dnsop-dns-zone-digest-05
 // we need the SOA info for that
 func (ctx *Context) AddZONEMDRecord() {
-	exists := false
-	for _, zonemd := range ctx.zonemd {
-		if zonemd.Hash == ctx.Config.HashAlg {
-			exists = true
-			break
-		}
-	}
+	_, exists := ctx.zonemdMap[ctx.Config.HashAlg]
 	if !exists {
 		zonemd := &dns.ZONEMD{
 			Hdr: dns.RR_Header{
@@ -113,25 +138,44 @@ func (ctx *Context) AddZONEMDRecord() {
 			Digest: strings.Repeat("00", 48),
 		}
 		ctx.rrs = append(ctx.rrs, zonemd)
-		ctx.zonemd = append(ctx.zonemd, zonemd)
+		ctx.zonemdMap[zonemd.Hash] = zonemd
 	}
 }
 
 // CleanDigests sets all root zone digests to 0
 // It is used before zone signing
 func (ctx *Context) CleanDigests() {
-	for _, rr := range ctx.rrs {
-		switch x := rr.(type) {
-		case *dns.ZONEMD:
-			x.Digest = strings.Repeat("0", len(x.Digest))
-		}
+	var wg sync.WaitGroup
+	n := len(ctx.rrs)
+	numSegments := runtime.NumCPU()
+	segmentSize := (n + numSegments - 1) / numSegments
+
+	for i := 0; i < len(ctx.rrs); i += segmentSize {
+		wg.Add(1)
+		go func(records []dns.RR) {
+			defer wg.Done()
+			for _, rr := range records {
+				if x, ok := rr.(*dns.ZONEMD); ok {
+					x.Digest = strings.Repeat("0", len(x.Digest))
+				}
+			}
+		}(ctx.rrs[i:minimum(i+segmentSize, len(ctx.rrs))])
 	}
+	wg.Wait()
+}
+
+// Obtains the minimum between two values
+func minimum(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // CalculateDigest calculates the digest for a PREVIOUSLY ORDERED zone.
 // This method returns the digest hex value.
 func (ctx *Context) CalculateDigest(hashAlg uint8) (string, error) {
-	if ctx.zonemd == nil {
+	if ctx.zonemdMap == nil {
 		return "", fmt.Errorf("error trying to calculate a digest without a ZONEMD RR present")
 	}
 	ctx.Log.Print("Started digest calculation.")
@@ -185,15 +229,9 @@ func (ctx *Context) CalculateDigest(hashAlg uint8) (string, error) {
 // This method updates the ZONEMD RR directly
 func (ctx *Context) UpdateDigest() (err error) {
 	ctx.Log.Printf("Updating ZONEMD Digest")
-	digestedPosition := -1
-	for i, mdRR := range ctx.zonemd {
-		if mdRR.Hash == ctx.Config.HashAlg {
-			digestedPosition = i
-			break
-		}
-	}
-	if digestedPosition < 0 {
-		zonemd := &dns.ZONEMD{
+	zonemd, found := ctx.zonemdMap[ctx.Config.HashAlg]
+	if !found {
+		zonemd = &dns.ZONEMD{
 			Hdr: dns.RR_Header{
 				Name:   ctx.soa.Header().Name,
 				Rrtype: dns.TypeZONEMD,
@@ -205,17 +243,17 @@ func (ctx *Context) UpdateDigest() (err error) {
 			Hash:   ctx.Config.HashAlg,
 			Digest: strings.Repeat("00", 48),
 		}
-		ctx.rrs = append(ctx.rrs, zonemd)
-		ctx.zonemd = append(ctx.zonemd, zonemd)
-		digestedPosition = len(ctx.zonemd) - 1
+		// Agregar al mapa
+		ctx.zonemdMap[ctx.Config.HashAlg] = zonemd
 	}
-
-	digest, err := ctx.CalculateDigest(ctx.zonemd[digestedPosition].Hash)
+	// Calcular el digest
+	digest, err :=
+		ctx.CalculateDigest(zonemd.Hash)
 	if err != nil {
 		return
 	}
-	ctx.zonemd[digestedPosition].Digest = digest
-	ctx.zonemd[digestedPosition].Serial = ctx.soa.Serial
+	zonemd.Digest = digest
+	zonemd.Serial = ctx.soa.Serial
 	return nil
 }
 
