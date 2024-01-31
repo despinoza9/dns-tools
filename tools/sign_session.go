@@ -4,6 +4,7 @@ import (
 	"crypto"
 	"encoding/base64"
 	"fmt"
+	"sync"
 
 	"github.com/miekg/dns"
 )
@@ -66,40 +67,52 @@ func Sign(session SignSession) (ds *dns.DS, err error) {
 		return nil, err
 	}
 	numTries := 3
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
 	for i, v := range rrSet {
-		if v[0].Header().Rrtype == dns.TypeZONEMD {
-			ctx.Log.Printf("[Signature %d/%d] Skipping RRSet because it is a ZONEMD RR", i+1, len(rrSet)+1)
-			continue // Skip it, we sign it post digest
-		}
-		for try := 1; try <= numTries; try++ {
-			rrSig := CreateNewRRSIG(ctx.Config.Zone,
-				zsk,
-				ctx.Config.RRSIGExpDate,
-				v[0].Header().Ttl)
-			ctx.Log.Printf("[Signature %d/%d] Creating RRSig for RRSet %s", i+1, len(rrSet)+1, v.String())
-			err = rrSig.Sign(keys.zskSigner, v)
-			if err != nil {
-				err = fmt.Errorf("cannot create RRSig: %s", err)
-				if try == numTries {
-					return
-				}
-				ctx.Log.Printf("%s. Retrying", err)
-				continue
+		wg.Add(1)
+		go func(i int, v RRArray) {
+			defer wg.Done()
+			if v[0].Header().Rrtype == dns.TypeZONEMD {
+				ctx.Log.Printf("[Signature %d/%d] Skipping RRSet because it is a ZONEMD RR", i+1, len(rrSet)+1)
+				return // Skip it, we sign it post digest
 			}
-			ctx.Log.Printf("[Signature %d/%d] Verifying RRSig for RRSet %s", i+1, len(rrSet)+1, v.String())
-			err = rrSig.Verify(zsk, v)
-			if err != nil {
-				err = fmt.Errorf("RRSig does not validate: %s", err)
-				if try == numTries {
-					return
+			for try := 1; try <= numTries; try++ {
+				mu.Lock()
+				rrSig := CreateNewRRSIG(ctx.Config.Zone,
+					zsk,
+					ctx.Config.RRSIGExpDate,
+					v[0].Header().Ttl)
+				ctx.Log.Printf("[Signature %d/%d] Creating RRSig "+
+					"for RRSet %s", i+1, len(rrSet)+1, v.String())
+				err = rrSig.Sign(keys.zskSigner, v)
+				mu.Unlock()
+				if err != nil {
+					err = fmt.Errorf("cannot create RRSig: %s", err)
+					if try == numTries {
+						return
+					}
+					ctx.Log.Printf("%s. Retrying", err)
+					continue
 				}
-				ctx.Log.Printf("%s. Retrying", err)
-				continue
+				ctx.Log.Printf("[Signature %d/%d] Verifying RRSig for "+
+					"RRSet %s", i+1, len(rrSet)+1, v.String())
+				err = rrSig.Verify(zsk, v)
+				if err != nil {
+					err = fmt.Errorf("RRSig does not validate: %s", err)
+					if try == numTries {
+						return
+					}
+					ctx.Log.Printf("%s. Retrying", err)
+					continue
+				}
+				ctx.rrs = append(ctx.rrs, rrSig)
+				break
 			}
-			ctx.rrs = append(ctx.rrs, rrSig)
-			break
-		}
+		}(i, v)
 	}
+	wg.Wait()
 
 	rrDNSKeys := RRArray{zsk, ksk}
 
@@ -136,12 +149,12 @@ func Sign(session SignSession) (ds *dns.DS, err error) {
 			ctx.Config.Zone,
 			zsk,
 			ctx.Config.RRSIGExpDate,
-			ctx.zonemd[0].Header().Ttl,
+			ctx.zonemdMap[ctx.Config.HashAlg].Header().Ttl,
 		)
 
 		var zmdrrs []dns.RR
 
-		for _, zmd := range ctx.zonemd {
+		for _, zmd := range ctx.zonemdMap {
 			zmdrrs = append(zmdrrs, dns.RR(zmd))
 		}
 
@@ -160,6 +173,7 @@ func Sign(session SignSession) (ds *dns.DS, err error) {
 		ctx.rrs = append(ctx.rrs, rrSig)
 		ctx.Log.Printf("Digest calculation done")
 	}
+
 	/* end DigestEnabled digest updating*/
 	ctx.Log.Printf("Signing done, writing zone")
 	ctx.PrintDS()

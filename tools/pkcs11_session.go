@@ -5,6 +5,7 @@ import (
 	"encoding/asn1"
 	"encoding/binary"
 	"fmt"
+	"sync"
 
 	"github.com/miekg/pkcs11"
 )
@@ -90,21 +91,26 @@ func (session *PKCS11Session) DestroyAllKeys() error {
 			pkcs11.NewAttribute(pkcs11.CKA_ID, nil),
 			pkcs11.NewAttribute(pkcs11.CKA_CLASS, nil),
 		}
-
+		var wg sync.WaitGroup
 		for _, object := range objects {
-			attr, _ := session.P11Context.GetAttributeValue(session.Handle, object, foundDeleteTemplate)
-			class := "unknown"
-			if uint(attr[2].Value[0]) == pkcs11.CKO_PUBLIC_KEY {
-				class = "public"
-			} else if uint(attr[2].Value[0]) == pkcs11.CKO_PRIVATE_KEY {
-				class = "private"
-			}
-			session.ctx.Log.Printf("Deleting key with rsaLabel=%s, id=%s and type=%s", string(attr[0].Value), string(attr[1].Value), class)
+			wg.Add(1)
+			go func(obj pkcs11.ObjectHandle) {
+				defer wg.Done()
+				attr, _ := session.P11Context.GetAttributeValue(session.Handle, obj, foundDeleteTemplate)
+				class := "unknown"
+				if uint(attr[2].Value[0]) == pkcs11.CKO_PUBLIC_KEY {
+					class = "public"
+				} else if uint(attr[2].Value[0]) == pkcs11.CKO_PRIVATE_KEY {
+					class = "private"
+				}
+				session.ctx.Log.Printf("Deleting key with rsaLabel=%s, id=%s and type=%s", string(attr[0].Value), string(attr[1].Value), class)
 
-			if e := session.P11Context.DestroyObject(session.Handle, object); e != nil {
-				session.ctx.Log.Printf("Destroy PKCS11Key failed %s", e)
-			}
+				if e := session.P11Context.DestroyObject(session.Handle, obj); e != nil {
+					session.ctx.Log.Printf("Destroy PKCS11Key failed %s", e)
+				}
+			}(object)
 		}
+		wg.Wait()
 	}
 	return nil
 }
@@ -221,38 +227,51 @@ func (session *PKCS11Session) searchValidKeys() (*SigKeys, error) {
 		zskSigner: zskSigner,
 	}
 	found := 0
+	var wg sync.WaitGroup
+	errorCh := make(chan error)
 	for _, object := range objects {
-		attr, err := session.P11Context.GetAttributeValue(session.Handle, object, keyTemplate)
-		if err != nil {
-			return nil, fmt.Errorf("cannot get attributes: %s", err)
-		}
-		class := uint(binary.LittleEndian.Uint32(attr[0].Value))
-		id := string(attr[1].Value)
+		wg.Add(1)
+		go func(obj pkcs11.ObjectHandle) {
+			defer wg.Done()
+			attr, err := session.P11Context.GetAttributeValue(session.Handle, obj, keyTemplate)
+			if err != nil {
+				errorCh <- fmt.Errorf("cannot get attributes: %s", err)
+				return
+			}
+			class := uint(binary.LittleEndian.Uint32(attr[0].Value))
+			id := string(attr[1].Value)
+			session.ctx.Log.Printf("Checking key class=%v and id=%s", class, id)
 
-		session.ctx.Log.Printf("Checking key class=%v and id=%s", class, id)
-
-		if class == pkcs11.CKO_PUBLIC_KEY {
-			if id == "zsk" {
-				session.ctx.Log.Printf("Found Public ZSK")
-				zskSigner.PK = object
-				found++
+			if class == pkcs11.CKO_PUBLIC_KEY {
+				if id == "zsk" {
+					session.ctx.Log.Printf("Found Public ZSK")
+					zskSigner.PK = obj
+					found++
+				}
+				if id == "ksk" {
+					session.ctx.Log.Printf("Found valid Public KSK")
+					kskSigner.PK = obj
+					found++
+				}
+			} else if class == pkcs11.CKO_PRIVATE_KEY {
+				if id == "zsk" {
+					session.ctx.Log.Printf("Found valid Private ZSK")
+					zskSigner.SK = obj
+					found++
+				} else if id == "ksk" {
+					session.ctx.Log.Printf("Found valid Private KSK")
+					kskSigner.SK = obj
+					found++
+				}
 			}
-			if id == "ksk" {
-				session.ctx.Log.Printf("Found valid Public KSK")
-				kskSigner.PK = object
-				found++
-			}
-		} else if class == pkcs11.CKO_PRIVATE_KEY {
-			if id == "zsk" {
-				session.ctx.Log.Printf("Found valid Private ZSK")
-				zskSigner.SK = object
-				found++
-			} else if id == "ksk" {
-				session.ctx.Log.Printf("Found valid Private KSK")
-				kskSigner.SK = object
-				found++
-			}
-		}
+		}(object)
+	}
+	go func() {
+		wg.Wait()
+		close(errorCh)
+	}()
+	for e := range errorCh {
+		return nil, e
 	}
 	switch {
 	case found == 0:

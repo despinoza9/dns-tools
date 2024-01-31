@@ -3,6 +3,7 @@ package tools
 import (
 	"fmt"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/miekg/dns"
@@ -37,32 +38,41 @@ func (ctx *Context) VerifyFile() (err error) {
 
 	rrSigPairs := make(map[string]*RRSigPair)
 
+	var wg sync.WaitGroup
+	var mu sync.Mutex
 	// Pairing each RRArray with its RRSig
 	for _, set := range setList {
-		if len(set) > 0 && ctx.isSignable(set[0].Header().Name) {
-			firstRR := set[0]
-			var setHash string
-			if firstRR.Header().Rrtype == dns.TypeRRSIG {
-				for _, sig := range set {
-					setHash = getRRSIGHash(sig.(*dns.RRSIG))
+		wg.Add(1)
+		go func(set RRArray) {
+			defer wg.Done()
+			if len(set) > 0 && ctx.isSignable(set[0].Header().Name) {
+				firstRR := set[0]
+				var setHash string
+				mu.Lock()
+				defer mu.Unlock()
+				if firstRR.Header().Rrtype == dns.TypeRRSIG {
+					for _, sig := range set {
+						setHash = getRRSIGHash(sig.(*dns.RRSIG))
+						pair, ok := rrSigPairs[setHash]
+						if !ok {
+							pair = &RRSigPair{}
+							rrSigPairs[setHash] = pair
+						}
+						pair.RRSig = sig.(*dns.RRSIG)
+					}
+				} else {
+					setHash = getHash(firstRR, true)
 					pair, ok := rrSigPairs[setHash]
 					if !ok {
 						pair = &RRSigPair{}
 						rrSigPairs[setHash] = pair
 					}
-					pair.RRSig = sig.(*dns.RRSIG)
+					pair.RRSet = set
 				}
-			} else {
-				setHash = getHash(firstRR, true)
-				pair, ok := rrSigPairs[setHash]
-				if !ok {
-					pair = &RRSigPair{}
-					rrSigPairs[setHash] = pair
-				}
-				pair.RRSet = set
 			}
-		}
+		}(set)
 	}
+	wg.Wait()
 
 	if len(ctx.DNSKEYS.ZSK) == 0 || len(ctx.DNSKEYS.KSK) == 0 {
 		err = ErrNotEnoughDNSkeys
@@ -72,12 +82,19 @@ func (ctx *Context) VerifyFile() (err error) {
 	rrSignatures := make(map[string]*RRSigPair)
 
 	for setName, pair := range rrSigPairs {
-		if pair.RRSet == nil || len(pair.RRSet) == 0 || pair.RRSig == nil {
-			// err = fmt.Errorf("the RRSet %s has no elements", setName)
-			continue
-		}
-		rrSignatures[setName] = pair
+		wg.Add(1)
+		go func(setName string, pair *RRSigPair) {
+			defer wg.Done()
+			if pair.RRSet == nil || len(pair.RRSet) == 0 || pair.RRSig == nil {
+				// err = fmt.Errorf("the RRSet %s has no elements", setName)
+				return
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			rrSignatures[setName] = pair
+		}(setName, pair)
 	}
+	wg.Wait()
 
 	// Checking each RRset RRSignature.
 	ctx.Log.Printf("number of signatures: %d", len(rrSignatures))
